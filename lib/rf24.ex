@@ -8,11 +8,14 @@ defmodule RF24 do
             rx: nil,
             spi: nil,
             ce_pin: 87,
-            csn_pin: 5,
-            irq_pin: 19,
+            # csn_pin: 5,
+            csn_pin: 23,
+            irq_pin: 89,
             spi_bus_name: "spidev1.0",
             p_variant: false,
-            dynamic_payloads_enabled: nil
+            dynamic_payloads_enabled: nil,
+            payload_size: 32,
+            pipe0_reading_address: nil
 
   use GenServer
 
@@ -25,14 +28,20 @@ defmodule RF24 do
     {:ok, struct(RF24, args)}
   end
 
-  def handle_info(:init, rf24) do
+  def radio_init(rf24) do
     with {:ok, ce} <- gpio_open(rf24.ce_pin, :output, initial_value: 0),
          {:ok, csn} <- gpio_open(rf24.csn_pin, :output, initial_value: 1),
          {:ok, irq} <- gpio_open(rf24.irq_pin, :input),
          :ok <- gpio_set_interrupts(irq, :both),
-         {:ok, spi} <- spi_open(rf24.spi_bus_name, mode: 0, speed_hz: 8_000_000) do
+         {:ok, spi} <- spi_open(rf24.spi_bus_name, mode: 0, speed_hz: 10_000_000) do
+      %{rf24 | ce: ce, csn: csn, irq: irq, spi: spi}
+    end
+  end
+
+  def handle_info(:init, rf24) do
+    with %RF24{} = rf24 <- radio_init(rf24) do
       send(self(), :reset)
-      {:noreply, %{rf24 | ce: ce, csn: csn, irq: irq, spi: spi}}
+      {:noreply, rf24}
     else
       error ->
         {:stop, error, rf24}
@@ -40,6 +49,7 @@ defmodule RF24 do
   end
 
   def handle_info(:reset, rf24) do
+    # gpio_write(rf24.ce, 1)
     gpio_write(rf24.ce, 0)
     gpio_write(rf24.csn, 1)
 
@@ -81,20 +91,37 @@ defmodule RF24 do
     rf24 =
       rf24
       |> open_writing_pipe(<<0xCE, 0xCC, 0xCE, 0xCC, 0xCE>>)
-      |> open_reading_pipe(1, <<0xCC, 0xCE, 0xCC, 0xCE, 0xCC>>)
+      |> open_reading_pipe(:RX_ADDR_P1, <<0xCC, 0xCE, 0xCC, 0xCE, 0xCC>>)
       |> power_up()
       |> enable_prx()
 
     gpio_write(rf24.ce, 1)
+
+    # Restore the pipe0 adddress, if exists
+    rf24 =
+      if rf24.pipe0_reading_address do
+        write_reg(rf24, :RX_ADDR_P0, rf24.pipe0_reading_address)
+      else
+        close_reading_pipe(rf24, :RX_ADDR_P0)
+      end
+
+    case read_reg_bin(rf24, :FEATURE) do
+      # check for en_ack_pay being set
+      <<_::5, _en_dpl::1, 1::1, _en_dy_ack::1>> ->
+        rf24 = flush_tx(rf24)
+        {:noreply, rf24}
+
+      _ ->
+        {:noreply, rf24}
+    end
 
     {:noreply, rf24}
   end
 
   def handle_info({:circuits_gpio, _pin, _ts, _} = interupt, rf24) do
     IO.puts("interupt: #{inspect(interupt)}")
-    status = read_status(rf24)
+    %{rx_dr: rx} = status = read_status(rf24)
     IO.inspect(status, label: "status")
-    {:noreply, rf24}
 
     # if tx do
     # end
@@ -102,9 +129,13 @@ defmodule RF24 do
     # if fail do
     # end
 
-    # if rx || available?(rf24) do
-    # else
-    #   {:noreply, rf24}
-    # end
+    if rx do
+      payload = read_payload(rf24)
+      IO.inspect(payload, label: "PAYLOAD")
+      rf24 = reset_status(rf24)
+      {:noreply, rf24}
+    else
+      {:noreply, rf24}
+    end
   end
 end
