@@ -1,5 +1,23 @@
 defmodule RF24 do
+  @moduledoc """
+  RF24 radio Interface.
+
+  # Basic Usage
+
+      iex(1)> {:ok, pid} = RF24.start_link()
+      {:ok, #PID<0.1933.0>}
+      # cause a remote device to send a few packets..
+      iex(2)> flush()
+      {RF24, 1, "Hello, world! x1"}
+      {RF24, 1, "Hello, world! x2"}
+      {RF24, 1, "Hello, world! x3"}
+      iex(3)> RF24.send(pid, "Welcome to the world of radio!", true)
+      <<14>>
+      iex(4)>
+  """
+
   import RF24.Util
+  require Logger
 
   defstruct csn: nil,
             ce: nil,
@@ -11,12 +29,23 @@ defmodule RF24 do
             csn_pin: 23,
             irq_pin: 89,
             spi_bus_name: "spidev1.0",
+            receiver_pid: nil,
             channel: 76,
             crc?: true,
             crc_2_bit?: true,
             auto_retransmit_delay: 5,
             auto_retransmit_count: 15,
             data_rate: :RF24_1MBPS
+
+  @derive {Inspect,
+           only: [
+             :channel,
+             :crc,
+             :crc_2_bit,
+             :auto_retransmit_delay,
+             :auto_retransmit_count,
+             :data_rate
+           ]}
 
   # power: :PWR_18DBM
 
@@ -30,14 +59,37 @@ defmodule RF24 do
 
   use GenServer
 
-  def start_link(args, opts \\ []) do
+  @doc """
+  Start a radio connection. `args` is a list or map of configuration.
+  See below for the available options.
+
+  # Wiring configuration
+
+    * `ce_pin` - GPIO pin number. (default=87)
+    * `csn_pin` - GPIO pin number. (default=23)
+    * `irq_pin` - GPIO pin number. (default=89)
+    * `spi_bus_name` - SPI bus name. (default=spidev1.0)
+
+  # Radio configuration
+
+    * `channel` - Frequency for the radio to receive and transmit on. Must be between 0 and 125. (default=76)
+    * `crc?` - Enable hardware level CRC checking. (default=true)
+    * `crc_2_bit?` - Enable 2 bit CRC checking. (requires `crc?` to be true) (default: true)
+    * `auto_retransmit_delay` - (uint8) milliseconds to wait before retransmitting a failed packet
+    * `auto_retransmit_count` - (uint8) number of retries before considering a packet failed. 
+    * `data_rate`  - `:RF24_250KBPS`, `:RF24_1MBPS`, or `:RF24_2MBPS`
+  """
+  def start_link(args \\ [], opts \\ []) do
+    args = put_in(args, [:receiver_pid], self())
     GenServer.start_link(__MODULE__, args, opts)
   end
 
   @doc """
-  send a packet
+  send a packet.
+  Payload must be a binary with a size of no more than 32 bytes.
+  Returns the contents of the status register
   """
-  def send(pid, payload, ack?) do
+  def send(pid, payload, ack?) when byte_size(payload) <= 32 and is_boolean(ack?) do
     GenServer.call(pid, {:send, payload, ack?})
   end
 
@@ -249,31 +301,66 @@ defmodule RF24 do
   end
 
   def handle_info({:circuits_gpio, _pin, _ts, _}, rf24) do
-    IO.puts("interupt")
+    handle_interupt(rf24)
+  end
+
+  # When an interupt happens, 
+  # one of three possible bits will be set.
+  # bit 6 = RX complete
+  # bit 5 = TX complete
+  # bit 4 = max retries (TX failed)
+  def handle_interupt(rf24) do
+    case read_reg_bin(rf24, :NRF_STATUS) do
+      <<_::1, 1::1, _tx::1, _max_retry::1, pipe::3, tx_full::1>> ->
+        handle_rx_interupt(rf24, pipe, tx_full)
+
+      <<_::1, _::1, 1::1, _max_retry::1, pipe::3, tx_full::1>> ->
+        handle_tx_interupt(rf24, pipe, tx_full)
+
+      <<_::1, _::1, _::1, 1::1, pipe::3, tx_full::1>> ->
+        handle_err_interupt(rf24, pipe, tx_full)
+    end
+  end
+
+  def handle_rx_interupt(rf24, pipe, tx_full) do
+    Logger.debug("Packet received on pipe #{pipe}")
+    rf24 = write_reg(rf24, :NRF_STATUS, <<0::1, 1::1, 1::1, 1::1, pipe::3, tx_full::1>>)
+
+    # check FEATURE.EN_DPL
+    # if it's set, we can get the full packet
+    # If FEATURE.EN_DPL is not set, the user will need to retrieve the packet
+    case read_reg_bin(rf24, :FEATURE) do
+      # EN_DPL is enabled
+      <<_::5, 1::1, _en_ack_pay::1, _en_dyn_ack::1>> ->
+        # retreive the packet
+        length = read_payload_length(rf24)
+        payload = read_payload(rf24, length)
+        # IO.inspect(payload, label: "PAYLOAD from pipe: #{pipe}")
+        send(rf24.receiver_pid, {__MODULE__, pipe, payload})
+        # send_ack_payload(rf24, 1, payload)
+        {:noreply, rf24}
+
+      # EN_DPL is not enabled 
+      # TODO implement this usecase?
+      <<_::5, 0::1, _en_ack_pay::1, _en_dyn_ack::1>> ->
+        {:noreply, rf24}
+    end
+  end
+
+  def handle_tx_interupt(rf24, pipe, tx_full) do
+    Logger.debug("Packet sent on pipe #{pipe}")
 
     rf24 =
-      case read_reg_bin(rf24, :NRF_STATUS) do
-        <<_::1, 1::1, _tx::1, _max_retry::1, pipe::3, tx_full::1>> ->
-          write_reg(rf24, :NRF_STATUS, <<0::1, 1::1, 1::1, 1::1, pipe::3, tx_full::1>>)
-          length = read_payload_length(rf24)
-          payload = read_payload(rf24, length)
+      rf24
+      |> write_reg(:NRF_STATUS, <<0::1, 1::1, 1::1, 1::1, pipe::3, tx_full::1>>)
+      |> enable_prx()
 
-          send_ack_payload(rf24, 1, payload)
-          IO.inspect(payload, label: "PAYLOAD from pipe: #{pipe}")
+    {:noreply, rf24}
+  end
 
-          rf24
-
-        <<_::1, _::1, 1::1, _max_retry::1, pipe::3, tx_full::1>> ->
-          IO.puts("packet sent")
-          # gpio_write(rf24.ce, 1)
-          write_reg(rf24, :NRF_STATUS, <<0::1, 1::1, 1::1, 1::1, pipe::3, tx_full::1>>)
-          enable_prx(rf24)
-
-        unk ->
-          IO.inspect(unk, label: "UNKNOWN!!!", base: :binary)
-          rf24
-      end
-
+  def handle_err_interupt(rf24, pipe, tx_full) do
+    Logger.error("Error sending packet on pipe #{pipe}")
+    rf24 = write_reg(rf24, :NRF_STATUS, <<0::1, 1::1, 1::1, 1::1, pipe::3, tx_full::1>>)
     {:noreply, rf24}
   end
 end
