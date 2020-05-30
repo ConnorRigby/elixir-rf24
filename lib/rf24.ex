@@ -17,7 +17,16 @@ defmodule RF24 do
   """
 
   import RF24.Util
-  require Logger
+
+  @derive {Inspect,
+           only: [
+             :channel,
+             :crc,
+             :crc_2_bit,
+             :auto_retransmit_delay,
+             :auto_retransmit_count,
+             :data_rate
+           ]}
 
   defstruct csn: nil,
             ce: nil,
@@ -36,16 +45,6 @@ defmodule RF24 do
             auto_retransmit_delay: 5,
             auto_retransmit_count: 15,
             data_rate: :RF24_1MBPS
-
-  @derive {Inspect,
-           only: [
-             :channel,
-             :crc,
-             :crc_2_bit,
-             :auto_retransmit_delay,
-             :auto_retransmit_count,
-             :data_rate
-           ]}
 
   # power: :PWR_18DBM
 
@@ -323,7 +322,6 @@ defmodule RF24 do
   end
 
   def handle_rx_interupt(rf24, pipe, tx_full) do
-    Logger.debug("Packet received on pipe #{pipe}")
     rf24 = write_reg(rf24, :NRF_STATUS, <<0::1, 1::1, 1::1, 1::1, pipe::3, tx_full::1>>)
 
     # check FEATURE.EN_DPL
@@ -336,7 +334,7 @@ defmodule RF24 do
         length = read_payload_length(rf24)
         payload = read_payload(rf24, length)
         # IO.inspect(payload, label: "PAYLOAD from pipe: #{pipe}")
-        send(rf24.receiver_pid, {__MODULE__, pipe, payload})
+        send(rf24.receiver_pid, {__MODULE__, {:packet_received, pipe, payload}})
         # send_ack_payload(rf24, 1, payload)
         {:noreply, rf24}
 
@@ -348,7 +346,7 @@ defmodule RF24 do
   end
 
   def handle_tx_interupt(rf24, pipe, tx_full) do
-    Logger.debug("Packet sent on pipe #{pipe}")
+    send(rf24.receiver_pid, {__MODULE__, {:packet_sent, pipe}})
 
     rf24 =
       rf24
@@ -359,8 +357,8 @@ defmodule RF24 do
   end
 
   def handle_err_interupt(rf24, pipe, tx_full) do
-    Logger.error("Error sending packet on pipe #{pipe}")
     rf24 = write_reg(rf24, :NRF_STATUS, <<0::1, 1::1, 1::1, 1::1, pipe::3, tx_full::1>>)
+    send(rf24.receiver_pid, {__MODULE__, {:packet_error, pipe}})
     {:noreply, rf24}
   end
 end

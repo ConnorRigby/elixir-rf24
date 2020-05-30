@@ -40,7 +40,28 @@ on any device that [ElixirCircuits](https://elixir-circuits.github.io/) supports
 
 ## Usage
 
-TODO
+Below is an example of the most basic usage from the Elixir console
+
+```elixir
+iex(1)> {:ok, pid} = RF24.start_link()
+{:ok, #PID<0.1933.0>}
+# cause a remote device to send a few packets..
+iex(2)> flush()
+{RF24, {:packet_received, 1, "Hello, world! x1"}}
+{RF24, {:packet_received, 1, "Hello, world! x2"}}
+{RF24, {:packet_received, 1, "Hello, world! x3"}}
+iex(3)> RF24.send(pid, "Welcome to the world of radio!", true)
+<<14>>
+iex(4)> flush()
+{RF24, {:packet_sent, 7}}
+```
+
+## Examples
+
+There is a complement to [this arduino example](https://github.com/nRF24/RF24/blob/master/examples/pingpair_irq_simple/pingpair_irq_simple.ino)
+in this project: [lib/rf24/simple_ping_pair.ex]
+
+[There is a repo here](https://github.com/ConnorRigby/elixir-radio-examples) with some more examples
 
 ## Encryption
 
