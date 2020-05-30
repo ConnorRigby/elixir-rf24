@@ -69,6 +69,14 @@ defmodule RF24.Util do
   #   |> write_reg(:EN_RXADDR, <<0b00111111::8>>)
   # end
 
+  def read_tx_addr(rf24) do
+    rf24 = select(rf24)
+    {:ok, _status} = spi_transfer(rf24.spi, <<0b000::3, reg(:TX_ADDR)::5>>)
+    {:ok, value} = spi_transfer(rf24.spi, <<0xFF::40>>)
+    unselect(rf24)
+    value
+  end
+
   def read_reg(rf24, addr) do
     <<value>> = read_reg_bin(rf24, addr)
     value
@@ -162,7 +170,7 @@ defmodule RF24.Util do
 
   def set_data_rate(rf24, data_rate)
       when data_rate in [:RF24_250KBPS, :RF24_1MBPS, :RF24_2MBPS] do
-    <<cont_wave::1, _::1, _rf_dr_low::1, pll_lock::1, _rf_dr_high::1, rf_pwr::2, _::1>> =
+    <<cont_wave::1, _::1, _rf_dr_low::1, pll_lock::1, _rf_dr_high::1, rf_pwr::2, 0::1>> =
       read_reg_bin(rf24, :RF_SETUP)
 
     case data_rate do
@@ -228,6 +236,45 @@ defmodule RF24.Util do
   def flush_tx(rf24) do
     rf24 = select(rf24)
     {:ok, _} = spi_transfer(rf24.spi, <<instr(:FLUSH_TX)>>)
+    unselect(rf24)
+  end
+
+  def send_payload(rf24, payload, ack?)
+
+  def send_payload(rf24, payload, true) when byte_size(payload) <= 32 do
+    send_payload(rf24, payload, 0b10100000)
+  end
+
+  def send_payload(rf24, payload, false) when byte_size(payload) <= 32 do
+    send_payload(rf24, payload, 0b10110000)
+  end
+
+  def send_payload(rf24, payload, instr) do
+    rf24 = enable_ptx(rf24)
+    rf24 = select(rf24)
+    {:ok, status} = spi_transfer(rf24.spi, <<instr>>)
+    {:ok, _} = spi_transfer(rf24.spi, payload)
+    unselect(rf24)
+
+    gpio_write(rf24.ce, 0)
+
+    Process.sleep(10)
+    gpio_write(rf24.ce, 1)
+
+    status
+  end
+
+  def send_ack_payload(rf24, pipe, payload) when byte_size(payload) <= 32 do
+    rf24 = enable_ptx(rf24)
+
+    rf24 = select(rf24)
+    {:ok, _} = spi_transfer(rf24.spi, <<0b10101::5, pipe::3>>)
+    {:ok, _} = spi_transfer(rf24.spi, payload)
+
+    gpio_write(rf24.ce, 0)
+    Process.sleep(10)
+    gpio_write(rf24.ce, 1)
+
     unselect(rf24)
   end
 
